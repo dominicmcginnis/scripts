@@ -1,0 +1,63 @@
+#!/usr/bin/perl
+
+use strict;
+use MIME::Lite;
+use Getopt::Long qw( :config no_ignore_case bundling );
+
+my @original_ARGV = @ARGV;
+
+# parse args
+my (
+     $opt_from,
+     $opt_image,
+     $opt_message,
+     $opt_replyto,
+     $opt_subject,
+     $opt_to,
+     $opt_host,
+   );
+GetOptions (
+           "f|from=s"          => \$opt_from,
+           "m|message=s"       => \$opt_message,
+           "i|image=s"         => \$opt_image,
+           "s|subject=s"       => \$opt_subject,
+           "t|to=s"            => \$opt_to,
+           "h|host=s"          => \$opt_host,
+    );
+
+my $default_from = 'rmcginnis@stubhub.com';
+my $from = defined $opt_from
+             ? $opt_from
+             : $default_from;
+
+# default SMTP servers to try
+my $default_mailhost = "127.0.0.1";
+my $host = defined $opt_host
+             ? $opt_host
+             : $default_mailhost;
+
+my @recipients = split /,/, $opt_to; 
+
+#uncomment for debugging
+#print "Options: \n --from: $from \n --message: $opt_message \n --image: $opt_image \n --subject: $opt_subject \n --to: @recipients \n --host: $host\n";
+
+my $msg = MIME::Lite->new(
+    From    =>$from,
+    To      =>@recipients,
+    Subject =>$opt_subject,
+    Type    =>'TEXT',
+    Data    =>$opt_message
+);
+
+my $part = MIME::Lite->new(
+    Top      => 0,
+    Disposition  =>'inline',
+    Type     =>'image/png',
+    Encoding =>'base64',
+    Path     =>$opt_image,
+);
+
+### Attach it to any message:
+$msg->attach($part);
+
+$msg->send;

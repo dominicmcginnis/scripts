@@ -1,0 +1,329 @@
+#!/usr/bin/perl
+
+# $Id: send_email,v 1.1 2006/11/02 23:46:29 dalban Exp $
+
+use strict;
+use warnings;
+
+use Getopt::Long qw( :config no_ignore_case bundling );
+use Net::Domain "hostfqdn";
+use Net::SMTP;
+use MIME::Base64 qw( encode_base64 );
+
+$ENV{ PATH } = "/sbin:/bin:/usr/sbin:/usr/bin";
+
+my $test_email = 'test@test.com';
+
+     # default value for Reply-To header in the message
+my $default_replyto = $test_email;
+
+     # default value for From header in the message
+my $default_from = $test_email;
+
+     # default value for envelope from (i.e., the "^From ") header
+my $default_envelope_from = $test_email;
+
+     # default SMTP servers to try
+my $default_mailhosts = [ qw( 127.0.0.1
+                              localhost
+                            )
+                        ];
+
+my $indent = "                           ";
+my $printable_default_mailhosts = "";
+map { $printable_default_mailhosts .= "$indent$_\n"; } @$default_mailhosts;
+
+( my $pgm = $0 ) =~ s=^.*/==s;
+
+my $usage = <<EndOfUsage;
+usage: $pgm options
+
+required options:
+
+  -s,--subject Subject   Use Subject as the subject of the email message
+
+  -t,--to Address[,Address[,Address[,...]]]
+                         Use given comma-delimited list of addresses for the
+                         To header in the email message.
+
+other options:
+
+  -d,--debug             Select debug output mode:  show SMTP commands and
+                         responses
+
+  -e,--envelope-from Address
+                         Use Address as the from value for the envelope, i.e.,
+                         the address to which a mailer daemon will attempt to
+                         send a bounce if the need arises.  The default value
+                         is:
+                           $default_envelope_from
+
+  -f,--from Address      Use Address as the value of the From header in the
+                         message.  The default value is:
+                           $default_from
+
+  -h,--help              List usage
+
+  -m,--message String    Use String as the message body.  The default is to
+                         read the message body from stdin.
+
+  -M,--mailhosts Host[,Host[,Host[,...]]]
+                         Use comma-delimited host list as the set of hosts to
+                         try as mail servers.  The default is to use the
+                         following servers (in the following order):
+$printable_default_mailhosts
+  -r,--reply-to Address  Use Address as the value of the Reply-To header in the
+                         message.  The default is to use:
+                           $default_replyto
+  
+  -c,--cc Address[,Address[,Address[,...]]]
+                         Use given comma-delimited list of addresses for the
+                         CC header in the email message.
+
+  -a,--attachment String     Use to attach a file to the email, must supply the type and name
+
+  -at,--attachment-type String     Use for the attachment content type
+
+  -an,--attachment-name String     Use for the attachment file name
+
+If the option argument to --envelope-from, --from, or --reply-to, is the string
+"me", then "USER\@HOST" is used as the option's value, where USER is the
+username associated with the effective UID of the current process and HOST is
+the host name of the current host.
+EndOfUsage
+
+     # no args?  print usage.  if run interactively, exit successfully.
+     # if run in batch mode, die.
+if ( not @ARGV ) {
+  warn $usage;
+  ( -t ) and exit 0;
+  exit 1;
+} # if
+
+my @original_ARGV = @ARGV;
+
+     # parse args
+my (
+     $opt_debug,
+     $opt_from,
+     $opt_help,
+     $opt_message,
+     $opt_mailhosts,
+     $opt_replyto,
+     $opt_envelope_from,
+     $opt_subject,
+     $opt_to,
+     $opt_cc,
+     $opt_attachment,
+     $opt_attachment_type,
+     $opt_attachment_name,
+   );
+if ( not GetOptions (
+           "d|debug"           => \$opt_debug,
+           "e|envelope-from=s" => \$opt_envelope_from,
+           "f|from=s"          => \$opt_from,
+           "h|help"            => \$opt_help,
+           "m|message=s"       => \$opt_message,
+           "M|mailhosts=s"     => \$opt_mailhosts,
+           "r|reply-to=s"      => \$opt_replyto,
+           "s|subject=s"       => \$opt_subject,
+           "t|to=s"            => \$opt_to,
+           "c|cc=s"            => \$opt_cc,
+           "a|attachment=s"    => \$opt_attachment,
+           "at|attachment-type=s"    => \$opt_attachment_type,
+           "an|attachment-name=s"    => \$opt_attachment_name,
+         )
+   )
+{
+  $opt_help and warn $usage and exit 0;
+  die $usage;
+} # if
+
+     # if @ARGV is non-empty after argument processing, it is likely that the
+     # caller should have quoted an option argument, to make the shell treat
+     # it as a single argument.  warn, but continue processing.
+if ( @ARGV ) {
+  warn "$pgm: warning: after argument processing, the following args",
+       " have been left in \@ARGV:",
+       " ( \"", join( "\", \"", @ARGV ), "\" )\n";
+  warn "$pgm: the original \@ARGV contained:",
+       " ( \"", join( "\", \"", @original_ARGV ), "\" )\n";
+} # if
+
+     # print usage statement; exit, no error
+$opt_help and print STDERR $usage and exit 0;
+
+     # check for required options
+( not defined $opt_subject or not defined $opt_to )
+  and die "$pgm: missing --to or --subject\n", $usage;
+
+     # get username associated with euid of this process.  also get
+     # fully qualified name of this host.
+my $user = getpwuid $>;
+my $hostfqdn = hostfqdn();
+my $user_at_host = "$user\@$hostfqdn";
+
+     # process option args; use default values if respective option
+     # args not given
+
+my $from = defined $opt_from
+             ? $opt_from
+             : $default_from;
+my $replyto = defined $opt_replyto
+                ? $opt_replyto
+                : $default_replyto;
+my $mailhosts = defined $opt_mailhosts
+                ? [ split ',', $opt_mailhosts ]
+                : $default_mailhosts;
+my $envelope_from = defined $opt_envelope_from
+                      ? $opt_envelope_from
+                      : $default_envelope_from;
+
+$from eq "me" and $from = $user_at_host;
+$replyto eq "me" and $replyto = $user_at_host;
+$envelope_from eq "me" and $envelope_from = $user_at_host;
+
+my $printable_mailhosts = join( ", ", @$mailhosts );
+
+     # get message body from option arg to --message, if present; from
+     # stdin otherwise
+my $message;
+if ( not defined $opt_message ) {
+  chomp( @$message = <STDIN> );
+} # if
+else {
+  @$message = split /\n/, $opt_message;
+} # if
+
+send_email( $message );
+
+#-----------------------------------------------------------------------
+     # return a string containingg the output of both the Net::Cmd
+     # method code() and the Net::Cmd method message(), separated by
+     # a space
+sub error_string {
+  my $smtp = shift;
+  sprintf "%s %s", $smtp->code(), $smtp->message();
+} # error_string
+
+#-----------------------------------------------------------------------
+     # connect to SMTP server and send the message.  Try the following
+     # for MAIL FROM:  username of current process; username of current
+     # process '@' hostfqdn of current host.  Try mail servers in
+     # @$mailhosts; stop after the first successful connection.
+sub send_email {
+  my $message = shift;
+  my $caller = ( caller 0 )[ 3 ];
+  not defined $message and die "$pgm: $caller(): \$message undefined\n";
+
+  my $message_body = "";
+  for my $line ( @$message ) {
+    $message_body = $message_body . $line;
+  } # for
+
+  my @recipients = split /,/, $opt_to; 
+ 
+  chomp( my $hostid = qx( hostid ));
+  not defined $hostid and $hostid = "(could not parse hostid)";
+
+  my @maybe_debug = defined $opt_debug ? ( Debug => 1 ) : ();
+
+       # establish mail server connection, trying servers in @$mailhosts
+  my $smtp;
+  for my $mailhost ( @$mailhosts ) {
+    defined( $smtp = Net::SMTP->new( $mailhost, @maybe_debug )) and last;
+  } # for
+
+  not defined $smtp
+    and die "$pgm: could not generate new Net::SMTP instance: $!;",
+            " tried mailhost(s): $printable_mailhosts\n";
+
+       # MAIL FROM ...
+  $smtp->mail( $envelope_from )
+    or die "$pgm: Net::SMTP->mail(): ", error_string( $smtp );
+
+  my @successful_recipients = $smtp->to( @recipients, { SkipBad => 1 } );
+  if ( @successful_recipients != @recipients ) {
+    my $status_string
+      = ( not @successful_recipients )
+          ? "none of these were accepted by the server"
+          : "server accepted only { \""
+              . join( '", "', @successful_recipients ) . "\" }";
+    warn "$pgm: invoked Net::SMTP->to() with recipient",
+         " list: { \"", join( '", "', @recipients ),
+         "\" }; Net::SMTP->to() indicates $status_string\n";
+  } # if
+
+  my $boundary = 'frontier';
+       # begin data
+  $smtp->data() or die "$pgm: Net::SMTP->data(): ", error_string( $smtp );
+
+       # send headers
+  $smtp->datasend("MIME-Version: 1.0\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend("Content-type: multipart/mixed;\n\tboundary=\"$boundary\"\n")    
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+
+  $smtp->datasend( "From: $from\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend( "To: $opt_to\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  if (!$opt_cc) { } else {
+	$smtp->datasend("CC: $opt_cc\n")
+    	  or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  }
+  $smtp->datasend( "Subject: $opt_subject\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend( "Reply-To: $replyto\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend( "X-Send-Email-Sender: $user_at_host\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend( "X-Send-Email-Hostid: $hostid\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+
+       # send blank line between headers and body proper
+  $smtp->datasend( "\n" )
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend("--$boundary\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  
+       # send message body
+  $smtp->datasend("Content-type: text/plain\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend( "$message_body" )
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend( "\n" )
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  $smtp->datasend("--$boundary\n")
+    or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+
+  # add attachment if available
+  if (!$opt_attachment) { } else {
+    $smtp->datasend("Content-Type: $opt_attachment_type; name=\"$opt_attachment_name\"\n")
+      or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+    $smtp->datasend("Content-Transfer-Encoding: base64\n")
+      or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+    $smtp->datasend("Content-Disposition: attachment; filename=\"$opt_attachment_name\"\n")
+      or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+    $smtp->datasend("\n")
+      or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+
+    my $buf;
+    open(DAT, "$opt_attachment") || die("Could not open binary file!");
+       binmode(DAT);
+       local $/=undef;
+       while (read(DAT, my $file, 4096)) {
+          $buf = &encode_base64( $file );
+          $smtp->datasend($buf)
+            or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+       }
+    close(DAT);
+    $smtp->datasend("\n")
+      or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+    $smtp->datasend("--$boundary\n")
+      or warn "$pgm: Net::SMTP->datasend(): ", error_string( $smtp );
+  }
+       # end of data
+  $smtp->dataend()
+      or warn "$pgm: Net::SMTP->dataend(): ", error_string( $smtp );
+} # send_email
